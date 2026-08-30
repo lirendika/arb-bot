@@ -1,0 +1,73 @@
+name: bot
+
+on:
+  schedule:
+    # Per JAM, bukan per 6 jam. Run berdurasi 5j45m, jadi jadwal 6-jam
+    # meninggalkan celah — dan cron GitHub sering dilewati di free tier.
+    # Dengan concurrency di bawah, run baru MENGANTRE (maks 1 pending) lalu
+    # langsung mengambil alih begitu run berjalan keluar. Celah ~detik.
+    - cron: '0 * * * *'
+  workflow_dispatch:            # tombol jalankan manual
+
+# Cegah dua instance jalan bersamaan — kalau dobel, nonce bentrok dan
+# bot bisa menjual dua kali. Run baru MENUNGGU, bukan membatalkan.
+concurrency:
+  group: bot-runtime
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # state.json harus bertahan antar-run supaya total kumulatif tidak reset.
+      # Kunci unik per run + restore-keys prefix = selalu memulihkan yang terbaru.
+      - uses: actions/cache@v4
+        with:
+          path: state.json
+          key: botstate-${{ github.run_id }}
+          restore-keys: botstate-
+
+      - name: seed state pertama kali
+        run: '[ -f state.json ] || cp seed-state.json state.json; cat state.json'
+
+      - run: pip install "web3>=7,<8"
+
+      - name: run bot
+        env:
+          PRIVATE_KEY:  ${{ secrets.PRIVATE_KEY }}
+          ARC_RPC:      ${{ secrets.ARC_RPC }}
+          POOL_ADDR:    ${{ secrets.POOL_ADDR }}
+          TOKEN_ADDR:   ${{ secrets.TOKEN_ADDR }}
+          QUOTE_ADDR:   ${{ secrets.QUOTE_ADDR }}
+          ROUTER_ADDR:  ${{ secrets.ROUTER_ADDR }}
+          TICK_FLOOR:   ${{ secrets.TICK_FLOOR }}
+          TICK_UPPER:   ${{ secrets.TICK_UPPER }}
+          L_IN:         ${{ secrets.L_IN }}
+          L_OUT:        ${{ secrets.L_OUT }}
+          EXPECTED_LG:  ${{ secrets.EXPECTED_LG }}
+          CHAIN_ID:     ${{ secrets.CHAIN_ID }}
+          TG_TOKEN:     ${{ secrets.TG_TOKEN }}
+          TG_CHAT:      ${{ secrets.TG_CHAT }}
+          DRY_RUN:      "false"
+          MODE:         "PASSIVE"
+          POLL_SEC:     "0.7"
+          TOKEN_COST:   "0.00026"
+          MIN_PROFIT:   "0.005"
+          PRIO_GWEI:    ${{ secrets.PRIO_GWEI }}
+          PRIO_LOW:     ${{ secrets.PRIO_LOW }}
+          PRIO_BATAS:   ${{ secrets.PRIO_BATAS }}
+          PRIO_MAX:     ${{ secrets.PRIO_MAX }}
+          BATAS_MAX:    ${{ secrets.BATAS_MAX }}
+          BUY_ON:       ${{ secrets.BUY_ON }}
+          MIN_BUY_NET:  ${{ secrets.MIN_BUY_NET }}
+          MAX_BUY_USD:  ${{ secrets.MAX_BUY_USD }}
+          USDC_SISA:    ${{ secrets.USDC_SISA }}
+          MAX_RUNTIME:  "20700"      # 5j45m, keluar rapi sebelum timeout 355m
+        run: python bot.py

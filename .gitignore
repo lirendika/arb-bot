@@ -1,0 +1,21 @@
+# rahasia & state
+.env
+.env.example
+
+bot.log
+run.out
+# dokumen berisi target — JANGAN masuk repo publik
+README.md
+PREFLIGHT.md
+SETUP-GITHUB.md
+fly.toml
+*.service
+start.sh
+Dockerfile
+swaps.json
+test.py
+__pycache__/
+setup-telegram.sh
+test-rpc.sh
+watch.py
+watch.out
