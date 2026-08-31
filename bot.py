@@ -77,15 +77,30 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
               logging.FileHandler(os.getenv("LOG_FILE", "bot.log"))])
 log = logging.getLogger("arb").info
 
-def notify(msg):
-    if not (TG_TOKEN and TG_CHAT): return
+def tg(method, payload, timeout=10):
+    if not TG_TOKEN: return None
     try:
-        urllib.request.urlopen(urllib.request.Request(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data=json.dumps({"chat_id": TG_CHAT, "text": msg}).encode(),
-            headers={"content-type": "application/json"}), timeout=10)
+        r = urllib.request.urlopen(urllib.request.Request(
+            f"https://api.telegram.org/bot{TG_TOKEN}/{method}",
+            data=json.dumps(payload).encode(),
+            headers={"content-type": "application/json"}), timeout=timeout)
+        return json.load(r)
     except Exception as e:
-        log(f"  notify gagal: {e}")
+        log(f"  telegram {method} gagal: {e}"); return None
+
+def notify(msg, chat=None):
+    """Kirim ke Telegram. <pre> dipakai supaya kolom angka tetap lurus di HP."""
+    if not (TG_TOKEN and (chat or TG_CHAT)): return
+    tg("sendMessage", {"chat_id": chat or TG_CHAT, "text": msg,
+                       "parse_mode": "HTML", "disable_web_page_preview": True})
+
+def rapi(judul, baris, kaki=None):
+    """Format seragam: judul tebal, isi rata kolom di dalam <pre>."""
+    lebar = max((len(a) for a, _ in baris), default=0)
+    isi = "\n".join(f"{a.ljust(lebar)}  {b}" for a, b in baris)
+    out = f"<b>{judul}</b>\n<pre>{isi}</pre>"
+    if kaki: out += f"\n<i>{kaki}</i>"
+    return out
 
 PK = os.getenv("PRIVATE_KEY")
 POOL_ABI  = json.loads('[{"inputs":[],"name":"slot0","outputs":[{"type":"uint160"},{"type":"int24"},{"type":"uint16"},{"type":"uint16"},{"type":"uint16"},{"type":"uint8"},{"type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"liquidity","outputs":[{"type":"uint128"}],"stateMutability":"view","type":"function"},{"inputs":[{"type":"int24"}],"name":"ticks","outputs":[{"type":"uint128"},{"type":"int128"},{"type":"uint256"},{"type":"uint256"},{"type":"int56"},{"type":"uint160"},{"type":"uint32"},{"type":"bool"}],"stateMutability":"view","type":"function"}]')
@@ -153,6 +168,7 @@ class Bot:
         self._nonce = None; self._gas = None; self._gas_t = 0
         self._bal = None; self._bal_t = 0
         self._usdc = None; self._usdc_t = 0
+        self._tg_off = 0; self._tg_t = 0
 
     # ---- lapisan RPC mentah: koneksi persisten, tanpa eth_chainId tersembunyi ----
     def _raw(self, method, params):
@@ -382,17 +398,90 @@ class Bot:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self.st.get("day") != today:
             if self.st.get("day"):
-                notify(f"ringkasan {self.st['day']}\n"
-                       f"panen {self.st['cycles']}x  ${self.st['usdc']:.4f}\n"
-                       f"token terpakai {self.st['tokens']:,.0f}  gagal {self.st['fails']}x\n"
-                       f"─────────\n"
-                       f"TOTAL sejak {self.st.get('sejak') or '?'}: "
-                       f"{self.st['tot_cycles']}x  ${self.st['tot_usdc']:.4f}")
+                notify(rapi(f"RINGKASAN {self.st['day']}", [
+                    ("panen", f"{self.st['cycles']}x"),
+                    ("diterima", f"${self.st['usdc']:,.4f}"),
+                    ("token terpakai", f"{self.st['tokens']:,.0f}"),
+                    ("gagal", f"{self.st['fails']}x"),
+                ], "/total untuk rekap seumur hidup"))
             # reset harian saja; total seumur hidup dibawa terus
             for k in ("cycles","fails"): self.st[k] = 0
             for k in ("usdc","tokens"): self.st[k] = 0.0
             self.st["day"] = today
             save_state(self.st)
+
+    # ---------- perintah Telegram ----------
+    def cek_perintah(self):
+        """Baca perintah masuk. Hanya dipanggil saat pool sepi, jadi tidak
+        pernah menunda panen. Pakai offset supaya update tidak terbaca dua kali."""
+        if not TG_TOKEN or time.time() - self._tg_t < 4: return
+        self._tg_t = time.time()
+        d = tg("getUpdates", {"offset": self._tg_off, "timeout": 0, "limit": 5}, timeout=8)
+        if not d or not d.get("ok"): return
+        for u in d.get("result", []):
+            self._tg_off = u["update_id"] + 1
+            m = u.get("message") or {}
+            teks = (m.get("text") or "").strip().lower().split("@")[0]
+            chat = str((m.get("chat") or {}).get("id", ""))
+            if TG_CHAT and chat != str(TG_CHAT): continue     # abaikan orang lain
+            if   teks == "/total":  notify(self.rekap(), chat)
+            elif teks == "/status": notify(self.status(), chat)
+            elif teks in ("/help", "/start"):
+                notify(rapi("PERINTAH", [
+                    ("/total", "rekap farming & untung"),
+                    ("/status", "kondisi pool & dompet sekarang"),
+                    ("/help", "pesan ini"),
+                ]), chat)
+
+    def rekap(self):
+        st = self.st
+        beli_tok = st.get("tot_beli_tok", 0.0); beli_usd = st.get("tot_beli_usd", 0.0)
+        jual_tok = st.get("tot_tokens", 0.0);   jual_usd = st.get("tot_usdc", 0.0)
+        gas = st.get("tot_gas", 0.0)
+        stok = self.token_balance() if self.acct else 0.0
+        # untung = USDC diterima - USDC dibelanjakan - nilai wajar token yg terpakai bersih
+        tok_bersih = jual_tok - beli_tok          # token yang benar2 keluar dari stok
+        untung = jual_usd - beli_usd - tok_bersih * TOKEN_COST - gas
+        return rapi("REKAP FARMING", [
+            ("— DIBORONG —", ""),
+            ("token", f"{beli_tok:,.0f}"),
+            ("dibayar", f"-${beli_usd:,.4f}"),
+            ("nilai wajar", f"${beli_tok*TOKEN_COST:,.4f}"),
+            ("", ""),
+            ("— DIJUAL —", ""),
+            ("token", f"{jual_tok:,.0f}"),
+            ("diterima", f"+${jual_usd:,.4f}"),
+            ("panen", f"{st.get('tot_cycles',0)}x"),
+            ("", ""),
+            ("— STOK —", ""),
+            ("token", f"{stok:,.0f}"),
+            ("nilai wajar", f"${stok*TOKEN_COST:,.2f}"),
+            ("", ""),
+            ("— HITUNGAN —", ""),
+            ("USDC masuk", f"+${jual_usd:,.4f}"),
+            ("USDC keluar", f"-${beli_usd:,.4f}"),
+            ("token terpakai" if tok_bersih >= 0 else "token bertambah",
+             f"{'-' if tok_bersih >= 0 else '+'}${abs(tok_bersih)*TOKEN_COST:,.4f}"),
+            ("gas", f"-${gas:,.4f}"),
+            ("UNTUNG BERSIH", f"${untung:+,.4f}"),
+        ], f"harga wajar ${TOKEN_COST}/token · sejak {st.get('sejak','?')}")
+
+    def status(self):
+        sq, L = self.read_state()
+        av = self.usdc_available(sq, L)
+        stok = self.token_balance() if self.acct else 0.0
+        kas = self.usdc_balance() if self.acct else 0.0
+        return rapi("STATUS", [
+            ("harga pool", f"${px(sq):.8f}"),
+            ("bisa dipanen", f"${av:,.4f}"),
+            ("zona", "di bawah lantai" if sq < SQ_FLOOR else "normal"),
+            ("", ""),
+            ("stok token", f"{stok:,.0f}"),
+            ("kas USDC", f"${kas:,.4f}"),
+            ("cukup untuk", f"~{stok/12545:.1f} kejadian besar"),
+            ("", ""),
+            ("hari ini", f"{self.st['cycles']}x  ${self.st['usdc']:,.4f}"),
+        ])
 
     def tick(self):
         self.roll_day()
@@ -425,16 +514,24 @@ class Bot:
                         self.st["tot_beli_usd"] = self.st.get("tot_beli_usd",0.0)+belanja
                         self.st["tot_beli_tok"] = self.st.get("tot_beli_tok",0.0)+dapat
                         save_state(self.st)
-                        notify(f"BORONG {dapat:,.0f} token seharga ${belanja:.4f}\n"
-                               f"nilai wajar ${dapat*TOKEN_COST:.4f}  bersih ${net:+.4f}\n"
-                               f"stok bertambah — modal 9x lebih murah dari DEX")
+                        notify(rapi("BORONG MURAH", [
+                            ("token didapat", f"{dapat:,.0f}"),
+                            ("dibayar", f"-${belanja:,.4f}"),
+                            ("harga/token", f"${belanja/dapat:.8f}"),
+                            ("harga wajar", f"${TOKEN_COST:.5f}"),
+                            ("nilai wajar", f"${dapat*TOKEN_COST:,.4f}"),
+                            ("gas", f"-${gas_c:,.4f}"),
+                            ("BERSIH", f"${net:+,.4f}"),
+                        ], f"{TOKEN_COST/(belanja/dapat):.0f}x lebih murah dari DEX  ·  masuk stok"))
                         time.sleep(3)
                     return
                 elif self.last_skip != round(sq/1e18,2):
                     log(f"  lewati borong: ${belanja:.4f} -> {dapat:,.0f} tok, bersih ${net:+.4f} (< ${MIN_BUY_NET})")
                     self.last_skip = round(sq/1e18,2)
 
-        if avail < DUST: return
+        if avail < DUST:
+            self.cek_perintah()      # pool sepi -> aman membaca perintah
+            return
         if DRY_RUN and sq == self.last_sq: return   # state belum berubah, sudah dihitung
         if self.st["cycles"] >= MAX_PER_DAY:
             log("  batas harian tercapai, menunggu reset UTC"); time.sleep(30); return
@@ -444,10 +541,12 @@ class Bot:
         sell = min(need, bal)
         if sell <= 0:
             log(f"  !! ${avail:.4f} tersedia tapi stok BASE habis — isi ulang dompet bot")
-            notify("STOK BASE HABIS — bot tidak bisa panen. Isi ulang dompet.")
+            notify(rapi("STOK HABIS", [("token tersisa", "0")],
+                        "bot tidak bisa panen — isi ulang dompet"))
             time.sleep(60); return
         if bal < LOW_INV and not self.warned_low:
-            log(f"  !! stok menipis: {bal:,.0f} BASE"); notify(f"stok BASE menipis: {bal:,.0f}")
+            log(f"  !! stok menipis: {bal:,.0f} BASE"); notify(rapi("STOK MENIPIS", [("sisa token", f"{bal:,.0f}"),
+                                         ("cukup untuk", f"~{bal/12545:.1f} kejadian besar")]))
             self.warned_low = True
         expected = self.usdc_for_tokens(sell, sq, L)
         # --- gate profit: jual kalau bersihnya positif, bukan kalau angkanya besar ---
@@ -477,21 +576,22 @@ class Bot:
             if not self.st.get("sejak"):
                 self.st["sejak"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             bersih = expected - sell * TOKEN_COST - gas_cost
-            tot_net = (self.st["tot_usdc"] - self.st["tot_tokens"] * TOKEN_COST
-                       - self.st["tot_gas"])
-            notify(f"PANEN ${expected:.4f}  (bersih ${bersih:+.4f})\n"
-                   f"jual {sell:,.0f} token @ ${expected/sell:.6f}\n"
-                   f"hari ini {self.st['cycles']}x  ${self.st['usdc']:.4f}\n"
-                   f"─────────\n"
-                   f"TOTAL {self.st['tot_cycles']}x panen  kotor ${self.st['tot_usdc']:.4f}\n"
-                   f"BERSIH ${tot_net:+.4f}  sejak {self.st.get('sejak')}")
+            notify(rapi("PANEN", [
+                ("diterima", f"${expected:,.4f}"),
+                ("token dijual", f"{sell:,.0f}"),
+                ("harga jual", f"${expected/sell:.6f}"),
+                ("modal token", f"-${sell*TOKEN_COST:,.4f}"),
+                ("gas", f"-${gas_cost:,.4f}"),
+                ("BERSIH", f"${bersih:+,.4f}"),
+            ], f"hari ini {self.st['cycles']}x  ·  /total untuk rekap"))
         else:
             self.st["fails"] += 1; self.st["tot_fails"] += 1; self.lose_streak += 1
             # Kalah balapan di peluang besar = info paling penting untuk dievaluasi.
             if expected >= 1.0:
-                notify(f"KALAH BALAPAN — peluang ${expected:.2f} lolos\n"
-                       f"priority {PRIO_GWEI}G, gagal {self.lose_streak}x berturut\n"
-                       f"kalau ini berulang, operator menaikkan tawaran mereka")
+                notify(rapi("KALAH BALAPAN", [
+                    ("peluang lolos", f"${expected:,.2f}"),
+                    ("gagal berturut", f"{self.lose_streak}x"),
+                ], "kalau berulang, operator menaikkan tawaran — pertimbangkan naikkan PRIO"))
             if self.lose_streak >= 3:
                 log(f"  kalah {self.lose_streak}x berturut — jeda 60s "
                     f"(ada yang lebih cepat; berhenti membakar gas)")
@@ -504,7 +604,11 @@ class Bot:
             f"priority {PRIO_LOW:.0f}/{PRIO_GWEI:.0f}/{PRIO_MAX:.0f}G "
             f"(batas ${PRIO_BATAS} & ${BATAS_MAX}) | "
             f"maks {MAX_PER_DAY}/hari")
-        notify(f"BASE bot start — dry_run={DRY_RUN} akun={self.me[:10]}…")
+        notify(rapi("BOT AKTIF", [
+            ("mode", "live" if not DRY_RUN else "dry-run"),
+            ("akun", f"{self.me[:8]}…{self.me[-4:]}"),
+            ("priority", f"{PRIO_LOW:.0f}/{PRIO_GWEI:.0f}/{PRIO_MAX:.0f} G"),
+        ], "perintah: /total  /status  /help"))
         self.verify_structure(); log("struktur LP terverifikasi")
         self.ensure_approval()
         backoff = 1; t0 = time.time()
@@ -522,7 +626,7 @@ class Bot:
                 except Exception: pass
                 continue
             time.sleep(POLL_SEC)
-        log("berhenti."); notify("BASE bot berhenti.")
+        log("berhenti."); notify("<b>BOT BERHENTI</b> — dirotasi, akan hidup lagi otomatis")
 
 if __name__ == "__main__":
     if MODE == "ACTIVE":
