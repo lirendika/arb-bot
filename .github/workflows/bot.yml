@@ -47,6 +47,7 @@ jobs:
           TOKEN_ADDR:   ${{ secrets.TOKEN_ADDR }}
           QUOTE_ADDR:   ${{ secrets.QUOTE_ADDR }}
           ROUTER_ADDR:  ${{ secrets.ROUTER_ADDR }}
+          PAIR_ADDR:    ${{ secrets.PAIR_ADDR }}
           TICK_FLOOR:   ${{ secrets.TICK_FLOOR }}
           TICK_UPPER:   ${{ secrets.TICK_UPPER }}
           L_IN:         ${{ secrets.L_IN }}

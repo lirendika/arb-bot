@@ -39,7 +39,11 @@ LOW_INV     = float(os.getenv("LOW_INV", "3000"))   # peringatan stok BASE menip
 # Gate berbasis PROFIT, bukan angka dolar sembarangan. Margin jual ~64% di semua
 # ukuran (harga jual efektif ~$0,00070-0,00075 vs modal beli), jadi yang benar-benar
 # membatasi hanya gas. Titik impas: avail ~$0,0041.
-TOKEN_COST = float(os.getenv("TOKEN_COST", "0.00026"))  # harga belimu di pool asli
+# Harga wajar dibaca LANGSUNG dari pair V2 di DEX sebenarnya, bukan konstanta.
+# Harga bergerak (sempat $0,00026 -> $0,00031 dalam sehari), dan konstanta basi
+# membuat semua hitungan untung serta gate profit meleset.
+PAIR_ADDR  = os.getenv("PAIR_ADDR", "")                 # pair V2 ARCAT/USDC
+TOKEN_COST = float(os.getenv("TOKEN_COST", "0.00026"))  # cadangan kalau pair tak terbaca
 MIN_PROFIT = float(os.getenv("MIN_PROFIT", "0.005"))    # profit bersih minimum per panen
 # Arc pakai EIP-1559. Operator terpantau membayar priority 25-33 Gwei dan menang
 # inklusi di +4 blok. Transaksi legacy dgn gasPrice 40 G hanya setara priority
@@ -169,6 +173,7 @@ class Bot:
         self._bal = None; self._bal_t = 0
         self._usdc = None; self._usdc_t = 0
         self._tg_off = 0; self._tg_t = 0
+        self._hw = None; self._hw_t = 0
 
     # ---- lapisan RPC mentah: koneksi persisten, tanpa eth_chainId tersembunyi ----
     def _raw(self, method, params):
@@ -235,6 +240,25 @@ class Bot:
             return L_OUT * (Q96 / sq - Q96 / SQ_FLOOR) / 1e18
         s2 = sq + d * Q96 / L_OUT
         return L_OUT * (Q96 / sq - Q96 / s2) / 1e18
+
+    def harga_wajar(self):
+        """Harga pasar sesungguhnya dari cadangan pair V2. Di-cache 120 detik —
+        pergerakan harga tidak secepat itu, dan ini di luar jalur balapan."""
+        global TOKEN_COST
+        if not PAIR_ADDR: return TOKEN_COST
+        if self._hw is None or time.time() - self._hw_t > 120:
+            try:
+                r = self._call(PAIR_ADDR, "0x0902f1ac")[2:]
+                r0 = int(r[0:64], 16); r1 = int(r[64:128], 16)
+                t0 = "0x" + self._call(PAIR_ADDR, "0x0dfe1681")[-40:]
+                tok, usd = (r0/1e18, r1/1e6) if t0.lower() == BASE.lower() else (r1/1e18, r0/1e6)
+                if tok > 0 and usd > 0:
+                    self._hw = usd / tok; self._hw_t = time.time()
+                    TOKEN_COST = self._hw
+            except Exception as e:
+                log(f"  harga pair gagal dibaca ({e}) — pakai ${TOKEN_COST}")
+                self._hw_t = time.time()
+        return self._hw or TOKEN_COST
 
     def usdc_balance(self):
         if self._usdc is None or time.time() - self._usdc_t > 120:
@@ -434,19 +458,19 @@ class Bot:
                 ]), chat)
 
     def rekap(self):
-        st = self.st
+        st = self.st; HW = self.harga_wajar()
         beli_tok = st.get("tot_beli_tok", 0.0); beli_usd = st.get("tot_beli_usd", 0.0)
         jual_tok = st.get("tot_tokens", 0.0);   jual_usd = st.get("tot_usdc", 0.0)
         gas = st.get("tot_gas", 0.0)
         stok = self.token_balance() if self.acct else 0.0
         # untung = USDC diterima - USDC dibelanjakan - nilai wajar token yg terpakai bersih
         tok_bersih = jual_tok - beli_tok          # token yang benar2 keluar dari stok
-        untung = jual_usd - beli_usd - tok_bersih * TOKEN_COST - gas
+        untung = jual_usd - beli_usd - tok_bersih * HW - gas
         return rapi("REKAP FARMING", [
             ("— DIBORONG —", ""),
             ("token", f"{beli_tok:,.0f}"),
             ("dibayar", f"-${beli_usd:,.4f}"),
-            ("nilai wajar", f"${beli_tok*TOKEN_COST:,.4f}"),
+            ("nilai wajar", f"${beli_tok*HW:,.4f}"),
             ("", ""),
             ("— DIJUAL —", ""),
             ("token", f"{jual_tok:,.0f}"),
@@ -455,16 +479,16 @@ class Bot:
             ("", ""),
             ("— STOK —", ""),
             ("token", f"{stok:,.0f}"),
-            ("nilai wajar", f"${stok*TOKEN_COST:,.2f}"),
+            ("nilai wajar", f"${stok*HW:,.2f}"),
             ("", ""),
             ("— HITUNGAN —", ""),
             ("USDC masuk", f"+${jual_usd:,.4f}"),
             ("USDC keluar", f"-${beli_usd:,.4f}"),
             ("token terpakai" if tok_bersih >= 0 else "token bertambah",
-             f"{'-' if tok_bersih >= 0 else '+'}${abs(tok_bersih)*TOKEN_COST:,.4f}"),
+             f"{'-' if tok_bersih >= 0 else '+'}${abs(tok_bersih)*HW:,.4f}"),
             ("gas", f"-${gas:,.4f}"),
             ("UNTUNG BERSIH", f"${untung:+,.4f}"),
-        ], f"harga wajar ${TOKEN_COST}/token · sejak {st.get('sejak','?')}")
+        ], f"harga wajar ${HW:.6f} (live DEX) · sejak {st.get('sejak','?')}")
 
     def status(self):
         sq, L = self.read_state()
@@ -487,6 +511,7 @@ class Bot:
         self.roll_day()
         sq, L = self.read_state()
         avail = self.usdc_available(sq, L)
+        HW = self.harga_wajar()
 
         now = time.time()
         if now - self.last_report > 900:          # heartbeat tiap 15 menit
@@ -505,10 +530,10 @@ class Bot:
             if belanja > 0:
                 dapat = self.tokens_from_buy(belanja, sq)
                 gas_c = (self.gas_price() + int(PRIO_LOW*1e9)) * 200000 / 1e18
-                net = dapat * TOKEN_COST - belanja - gas_c
+                net = dapat * HW - belanja - gas_c
                 if net >= MIN_BUY_NET:
                     log(f"BORONG ${belanja:.4f} -> {dapat:,.0f} token "
-                        f"(nilai ${dapat*TOKEN_COST:.4f}) | bersih ${net:+.4f}")
+                        f"(nilai ${dapat*HW:.4f}) | bersih ${net:+.4f}")
                     if self.swap(belanja, dapat*0.97, net, jual=False):
                         self.st["tot_beli"] = self.st.get("tot_beli",0)+1
                         self.st["tot_beli_usd"] = self.st.get("tot_beli_usd",0.0)+belanja
@@ -518,11 +543,11 @@ class Bot:
                             ("token didapat", f"{dapat:,.0f}"),
                             ("dibayar", f"-${belanja:,.4f}"),
                             ("harga/token", f"${belanja/dapat:.8f}"),
-                            ("harga wajar", f"${TOKEN_COST:.5f}"),
-                            ("nilai wajar", f"${dapat*TOKEN_COST:,.4f}"),
+                            ("harga wajar", f"${HW:.6f}"),
+                            ("nilai wajar", f"${dapat*HW:,.4f}"),
                             ("gas", f"-${gas_c:,.4f}"),
                             ("BERSIH", f"${net:+,.4f}"),
-                        ], f"{TOKEN_COST/(belanja/dapat):.0f}x lebih murah dari DEX  ·  masuk stok"))
+                        ], f"{HW/(belanja/dapat):.0f}x lebih murah dari DEX  ·  masuk stok"))
                         time.sleep(3)
                     return
                 elif self.last_skip != round(sq/1e18,2):
@@ -553,7 +578,7 @@ class Bot:
         # perkiraan kasar dulu (pakai priority rendah) untuk gate profit;
         # nilai pastinya dihitung ulang setelah ukuran panen diketahui
         gas_cost = (self.gas_price() + int(PRIO_LOW * 1e9)) * 130000 / 1e18
-        profit = expected - sell * TOKEN_COST - gas_cost
+        profit = expected - sell * HW - gas_cost
         if profit < MIN_PROFIT:
             if self.last_skip != round(avail, 4):
                 log(f"  lewati: avail ${avail:.4f} -> bersih ${profit:+.4f} "
@@ -575,12 +600,12 @@ class Bot:
             self.st["tot_tokens"] += sell; self.st["tot_gas"] += gas_cost
             if not self.st.get("sejak"):
                 self.st["sejak"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            bersih = expected - sell * TOKEN_COST - gas_cost
+            bersih = expected - sell * HW - gas_cost
             notify(rapi("PANEN", [
                 ("diterima", f"${expected:,.4f}"),
                 ("token dijual", f"{sell:,.0f}"),
                 ("harga jual", f"${expected/sell:.6f}"),
-                ("modal token", f"-${sell*TOKEN_COST:,.4f}"),
+                ("modal token", f"-${sell*HW:,.4f}"),
                 ("gas", f"-${gas_cost:,.4f}"),
                 ("BERSIH", f"${bersih:+,.4f}"),
             ], f"hari ini {self.st['cycles']}x  ·  /total untuk rekap"))
