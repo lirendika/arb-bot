@@ -9,7 +9,7 @@ dan hanya rugi gas (~$0,0026).
 
 Mode ACTIVE terbukti rugi di semua ukuran umpan dan dikunci.
 """
-import os, sys, time, json, math, signal, logging, urllib.request, http.client
+import os, sys, time, json, math, signal, logging, urllib.request, http.client, threading
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 from web3 import Web3
@@ -176,32 +176,41 @@ class Bot:
         self._hw = None; self._hw_t = 0
 
     # ---- lapisan RPC mentah: koneksi persisten, tanpa eth_chainId tersembunyi ----
-    def _raw(self, method, params):
+    def _raw(self, method, params, alt=False):
+        """alt=True memakai koneksi kedua, khusus thread Telegram."""
+        if alt:
+            with self._lock_alt:
+                return self._raw_on("_conn2", method, params)
+        return self._raw_on("_conn", method, params)
+
+    def _raw_on(self, attr, method, params):
         body = json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params})
         for attempt in (0, 1):
             try:
-                if self._conn is None:
+                if getattr(self, attr) is None:
                     u = urlparse(RPC_URL)
-                    self._conn = (http.client.HTTPSConnection(u.hostname, 443, timeout=10)
-                                  if u.scheme == "https" else
-                                  http.client.HTTPConnection(u.hostname, u.port or 80, timeout=10))
+                    setattr(self, attr, http.client.HTTPSConnection(u.hostname, 443, timeout=10)
+                            if u.scheme == "https" else
+                            http.client.HTTPConnection(u.hostname, u.port or 80, timeout=10))
                     self._path = u.path or "/"
-                self._conn.request("POST", self._path, body, {"content-type":"application/json"})
-                d = json.loads(self._conn.getresponse().read())
+                c = getattr(self, attr)
+                c.request("POST", self._path, body, {"content-type":"application/json"})
+                d = json.loads(c.getresponse().read())
                 if "error" in d: raise RuntimeError(d["error"])
                 return d["result"]
             except RuntimeError: raise
             except Exception:
-                try: self._conn.close()
+                try: getattr(self, attr).close()
                 except Exception: pass
-                self._conn = None
+                setattr(self, attr, None)
                 if attempt: raise
 
-    def _call(self, to, data):
-        return self._raw("eth_call", [{"to": to, "data": data}, "latest"])
+    def _call(self, to, data, alt=False):
+        return self._raw("eth_call", [{"to": to, "data": data}, "latest"], alt)
 
     def connect(self):
-        self._conn = None; self._path = "/"
+        self._conn = None; self._conn2 = None; self._path = "/"
+        self._lock_alt = threading.Lock()
         self.w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 15}))
         self.acct = self.w3.eth.account.from_key(PK) if PK else None
         self.me = self.acct.address if self.acct else "0x" + "0"*40
@@ -435,11 +444,18 @@ class Bot:
             save_state(self.st)
 
     # ---------- perintah Telegram ----------
+    def jalan_telegram(self):
+        """Thread daemon. Dipisah dari loop perdagangan supaya panggilan Telegram
+        yang lambat TIDAK PERNAH menunda panen — operator bereaksi 2-4 detik,
+        jadi tertahan 8 detik menunggu Telegram = kalah otomatis."""
+        while RUN:
+            try: self.cek_perintah()
+            except Exception as e: log(f"  thread telegram: {e}")
+            time.sleep(5)
+
     def cek_perintah(self):
-        """Baca perintah masuk. Hanya dipanggil saat pool sepi, jadi tidak
-        pernah menunda panen. Pakai offset supaya update tidak terbaca dua kali."""
-        if not TG_TOKEN or time.time() - self._tg_t < 4: return
-        self._tg_t = time.time()
+        """Dipanggil HANYA dari thread Telegram, tidak pernah dari loop utama."""
+        if not TG_TOKEN: return
         d = tg("getUpdates", {"offset": self._tg_off, "timeout": 0, "limit": 5}, timeout=8)
         if not d or not d.get("ok"): return
         for u in d.get("result", []):
@@ -462,7 +478,7 @@ class Bot:
         beli_tok = st.get("tot_beli_tok", 0.0); beli_usd = st.get("tot_beli_usd", 0.0)
         jual_tok = st.get("tot_tokens", 0.0);   jual_usd = st.get("tot_usdc", 0.0)
         gas = st.get("tot_gas", 0.0)
-        stok = self.token_balance() if self.acct else 0.0
+        stok = (int(self._call(BASE, "0x70a08231"+"0"*24+self.me[2:].lower(), alt=True), 16)/1e18) if self.acct else 0.0
         # untung = USDC diterima - USDC dibelanjakan - nilai wajar token yg terpakai bersih
         tok_bersih = jual_tok - beli_tok          # token yang benar2 keluar dari stok
         untung = jual_usd - beli_usd - tok_bersih * HW - gas
@@ -491,10 +507,11 @@ class Bot:
         ], f"harga wajar ${HW:.6f} (live DEX) · sejak {st.get('sejak','?')}")
 
     def status(self):
-        sq, L = self.read_state()
+        sq = int(self._call(POOL, "0x3850c7bd", alt=True)[2:66], 16)
+        L = L_IN if (SQ_UPPER and SQ_FLOOR <= sq < SQ_UPPER) else L_OUT
         av = self.usdc_available(sq, L)
-        stok = self.token_balance() if self.acct else 0.0
-        kas = self.usdc_balance() if self.acct else 0.0
+        stok = (int(self._call(BASE, "0x70a08231"+"0"*24+self.me[2:].lower(), alt=True), 16)/1e18) if self.acct else 0.0
+        kas  = (int(self._raw("eth_getBalance", [self.me, "latest"], alt=True), 16)/1e18) if self.acct else 0.0
         return rapi("STATUS", [
             ("harga pool", f"${px(sq):.8f}"),
             ("bisa dipanen", f"${av:,.4f}"),
@@ -554,9 +571,7 @@ class Bot:
                     log(f"  lewati borong: ${belanja:.4f} -> {dapat:,.0f} tok, bersih ${net:+.4f} (< ${MIN_BUY_NET})")
                     self.last_skip = round(sq/1e18,2)
 
-        if avail < DUST:
-            self.cek_perintah()      # pool sepi -> aman membaca perintah
-            return
+        if avail < DUST: return
         if DRY_RUN and sq == self.last_sq: return   # state belum berubah, sudah dihitung
         if self.st["cycles"] >= MAX_PER_DAY:
             log("  batas harian tercapai, menunggu reset UTC"); time.sleep(30); return
@@ -635,6 +650,9 @@ class Bot:
             ("priority", f"{PRIO_LOW:.0f}/{PRIO_GWEI:.0f}/{PRIO_MAX:.0f} G"),
         ], "perintah: /total  /status  /help"))
         self.verify_structure(); log("struktur LP terverifikasi")
+        if TG_TOKEN:
+            threading.Thread(target=self.jalan_telegram, daemon=True).start()
+            log("thread Telegram jalan (terpisah dari loop perdagangan)")
         self.ensure_approval()
         backoff = 1; t0 = time.time()
         while RUN:
