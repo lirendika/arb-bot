@@ -484,30 +484,32 @@ class Bot:
         beli_tok = st.get("tot_beli_tok", 0.0); beli_usd = st.get("tot_beli_usd", 0.0)
         jual_tok = st.get("tot_tokens", 0.0);   jual_usd = st.get("tot_usdc", 0.0)
         gas = st.get("tot_gas", 0.0)
+        n_jual = st.get("tot_cycles", 0); n_beli = st.get("tot_beli", 0)
         stok = (int(self._call(BASE, "0x70a08231"+"0"*24+self.me[2:].lower(), alt=True), 16)/1e18) if self.acct else 0.0
-        # untung = USDC diterima - USDC dibelanjakan - nilai wajar token yg terpakai bersih
-        tok_bersih = jual_tok - beli_tok          # token yang benar2 keluar dari stok
-        untung = jual_usd - beli_usd - tok_bersih * HW - gas
+        # Untung = USDC bersih + nilai token yang MASUK - nilai token yang KELUAR - gas
+        nilai_beli = beli_tok * HW      # token bertambah  -> menambah kekayaan
+        nilai_jual = jual_tok * HW      # token berkurang  -> mengurangi kekayaan
+        untung = (jual_usd - beli_usd) + nilai_beli - nilai_jual - gas
         return rapi("REKAP FARMING", [
-            ("— DIBORONG —", ""),
-            ("token", f"{beli_tok:,.0f}"),
+            ("— DIBELI —", f"{n_beli}x panen"),
+            ("$ARCAT", f"{beli_tok:,.0f}"),
             ("dibayar", f"-${beli_usd:,.4f}"),
-            ("nilai wajar", f"${beli_tok*HW:,.4f}"),
+            ("nilai token", f"+${nilai_beli:,.4f}"),
             ("", ""),
-            ("— DIJUAL —", ""),
-            ("token", f"{jual_tok:,.0f}"),
+            ("— DIJUAL —", f"{n_jual}x panen"),
+            ("$ARCAT", f"{jual_tok:,.0f}"),
             ("diterima", f"+${jual_usd:,.4f}"),
-            ("panen", f"{st.get('tot_cycles',0)}x"),
+            ("nilai token", f"-${nilai_jual:,.4f}"),
             ("", ""),
             ("— STOK —", ""),
-            ("token", f"{stok:,.0f}"),
+            ("$ARCAT", f"{stok:,.0f}"),
             ("nilai wajar", f"${stok*HW:,.2f}"),
             ("", ""),
-            ("— HITUNGAN —", ""),
+            ("— HITUNGAN —", f"{n_beli+n_jual}x panen total"),
             ("USDC masuk", f"+${jual_usd:,.4f}"),
             ("USDC keluar", f"-${beli_usd:,.4f}"),
-            ("token terpakai" if tok_bersih >= 0 else "token bertambah",
-             f"{'-' if tok_bersih >= 0 else '+'}${abs(tok_bersih)*HW:,.4f}"),
+            ("token bertambah", f"+${nilai_beli:,.4f}"),
+            ("token berkurang", f"-${nilai_jual:,.4f}"),
             ("gas", f"-${gas:,.4f}"),
             ("UNTUNG BERSIH", f"${untung:+,.4f}"),
         ], f"harga wajar ${HW:.6f} (live DEX) · sejak {st.get('sejak','?')}")
@@ -523,7 +525,7 @@ class Bot:
             ("bisa dipanen", f"${av:,.4f}"),
             ("zona", "di bawah lantai" if sq < SQ_FLOOR else "normal"),
             ("", ""),
-            ("stok token", f"{stok:,.0f}"),
+            ("stok $ARCAT", f"{stok:,.0f}"),
             ("kas USDC", f"${kas:,.4f}"),
             ("cukup untuk", f"~{stok/12545:.1f} kejadian besar"),
             ("", ""),
@@ -555,15 +557,17 @@ class Bot:
                 gas_c = (self.gas_price() + int(PRIO_LOW*1e9)) * 200000 / 1e18
                 net = dapat * HW - belanja - gas_c
                 if net >= MIN_BUY_NET:
-                    log(f"BORONG ${belanja:.4f} -> {dapat:,.0f} token "
+                    log(f"BELI ${belanja:.4f} -> {dapat:,.0f} token "
                         f"(nilai ${dapat*HW:.4f}) | bersih ${net:+.4f}")
                     if self.swap(belanja, dapat*0.97, net, jual=False):
                         self.st["tot_beli"] = self.st.get("tot_beli",0)+1
                         self.st["tot_beli_usd"] = self.st.get("tot_beli_usd",0.0)+belanja
                         self.st["tot_beli_tok"] = self.st.get("tot_beli_tok",0.0)+dapat
+                        self.st["tot_gas"] = self.st.get("tot_gas",0.0)+gas_c
+                        self.st["cycles"] = self.st.get("cycles",0)+1
                         save_state(self.st)
-                        notify(rapi("BORONG MURAH", [
-                            ("token didapat", f"{dapat:,.0f}"),
+                        notify(rapi("BELI MURAH", [
+                            ("$ARCAT didapat", f"{dapat:,.0f}"),
                             ("dibayar", f"-${belanja:,.4f}"),
                             ("harga/token", f"${belanja/dapat:.8f}"),
                             ("harga wajar", f"${HW:.6f}"),
@@ -574,7 +578,7 @@ class Bot:
                         time.sleep(3)
                     return
                 elif self.last_skip != round(sq/1e18,2):
-                    log(f"  lewati borong: ${belanja:.4f} -> {dapat:,.0f} tok, bersih ${net:+.4f} (< ${MIN_BUY_NET})")
+                    log(f"  lewati beli: ${belanja:.4f} -> {dapat:,.0f} tok, bersih ${net:+.4f} (< ${MIN_BUY_NET})")
                     self.last_skip = round(sq/1e18,2)
 
         if avail < DUST: return
@@ -624,9 +628,9 @@ class Bot:
             bersih = expected - sell * HW - gas_cost
             notify(rapi("PANEN", [
                 ("diterima", f"${expected:,.4f}"),
-                ("token dijual", f"{sell:,.0f}"),
+                ("$ARCAT dijual", f"{sell:,.0f}"),
                 ("harga jual", f"${expected/sell:.6f}"),
-                ("modal token", f"-${sell*HW:,.4f}"),
+                ("nilai token", f"-${sell*HW:,.4f}"),
                 ("gas", f"-${gas_cost:,.4f}"),
                 ("BERSIH", f"${bersih:+,.4f}"),
             ], f"hari ini {self.st['cycles']}x  ·  /total untuk rekap"))
@@ -675,7 +679,7 @@ class Bot:
                 except Exception: pass
                 continue
             time.sleep(POLL_SEC)
-        log("berhenti."); notify("<b>BOT BERHENTI</b> — dirotasi, akan hidup lagi otomatis")
+        log("berhenti."); notify("<b>BOT BERHENTI</b> — redeploy")
 
 if __name__ == "__main__":
     if MODE == "ACTIVE":

@@ -1,5 +1,5 @@
 {
- "day": "",
+ "day": "2026-09-01",
  "cycles": 0,
  "usdc": 0.0,
  "tokens": 0.0,
@@ -7,7 +7,10 @@
  "tot_cycles": 4,
  "tot_usdc": 2.0214,
  "tot_tokens": 181.2752,
- "tot_gas": 0.0231,
+ "tot_gas": 0.0909,
  "tot_fails": 0,
- "sejak": "2026-08-28"
+ "sejak": "2026-08-28",
+ "tot_beli": 6,
+ "tot_beli_usd": 0.006,
+ "tot_beli_tok": 308539.0
 }
