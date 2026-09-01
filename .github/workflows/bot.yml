@@ -58,7 +58,7 @@ jobs:
           TG_CHAT:      ${{ secrets.TG_CHAT }}
           DRY_RUN:      "false"
           MODE:         "PASSIVE"
-          POLL_SEC:     "0.7"
+          POLL_SEC:     ${{ secrets.POLL_SEC }}
           TOKEN_COST:   "0.00026"
           MIN_PROFIT:   "0.005"
           PRIO_GWEI:    ${{ secrets.PRIO_GWEI }}

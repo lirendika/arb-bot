@@ -70,7 +70,7 @@ DUST       = float(os.getenv("DUST", "0.004"))          # abaikan di bawah ini
 SLIPPAGE   = float(os.getenv("SLIPPAGE", "0.97"))     # amountOutMinimum = perkiraan x ini
 # Jendela balapan ~100 detik (jeda antara bot lawan beli dan menarik uangnya balik).
 # Polling 2 detik masih memberi ~50 kesempatan, tapi beban RPC turun 5x.
-POLL_SEC   = float(os.getenv("POLL_SEC", "0.7"))
+POLL_SEC   = float(os.getenv("POLL_SEC", "0.35"))
 MAX_PER_DAY= int(os.getenv("MAX_PER_DAY", "40"))      # reset otomatis tiap hari UTC
 MAX_RUNTIME= int(os.getenv("MAX_RUNTIME", "0"))       # detik; 0 = tanpa batas
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
@@ -250,16 +250,19 @@ class Bot:
         s2 = sq + d * Q96 / L_OUT
         return L_OUT * (Q96 / sq - Q96 / s2) / 1e18
 
-    def harga_wajar(self):
+    def harga_wajar(self, segarkan=False):
         """Harga pasar sesungguhnya dari cadangan pair V2. Di-cache 120 detik —
         pergerakan harga tidak secepat itu, dan ini di luar jalur balapan."""
         global TOKEN_COST
         if not PAIR_ADDR: return TOKEN_COST
+        # Hanya menyegarkan kalau diminta eksplisit (dari thread latar).
+        # Di jalur perdagangan, segarkan=False -> selalu pakai cache, nol RPC.
+        if self._hw is not None and not segarkan: return self._hw
         if self._hw is None or time.time() - self._hw_t > 120:
             try:
-                r = self._call(PAIR_ADDR, "0x0902f1ac")[2:]
+                r = self._call(PAIR_ADDR, "0x0902f1ac", alt=True)[2:]
                 r0 = int(r[0:64], 16); r1 = int(r[64:128], 16)
-                t0 = "0x" + self._call(PAIR_ADDR, "0x0dfe1681")[-40:]
+                t0 = "0x" + self._call(PAIR_ADDR, "0x0dfe1681", alt=True)[-40:]
                 tok, usd = (r0/1e18, r1/1e6) if t0.lower() == BASE.lower() else (r1/1e18, r0/1e6)
                 if tok > 0 and usd > 0:
                     self._hw = usd / tok; self._hw_t = time.time()
@@ -444,12 +447,15 @@ class Bot:
             save_state(self.st)
 
     # ---------- perintah Telegram ----------
-    def jalan_telegram(self):
-        """Thread daemon. Dipisah dari loop perdagangan supaya panggilan Telegram
-        yang lambat TIDAK PERNAH menunda panen — operator bereaksi 2-4 detik,
-        jadi tertahan 8 detik menunggu Telegram = kalah otomatis."""
+    def jalan_latar(self):
+        """Thread daemon: baca perintah Telegram DAN segarkan harga wajar.
+        Keduanya dipisah dari loop perdagangan — operator mendarat di +5 blok,
+        jadi tambahan 500 ms di jalur kritis sudah cukup untuk kalah."""
         while RUN:
-            try: self.cek_perintah()
+            try: self.harga_wajar(segarkan=True)
+            except Exception as e: log(f"  segarkan harga: {e}")
+            try:
+                if TG_TOKEN: self.cek_perintah()
             except Exception as e: log(f"  thread telegram: {e}")
             time.sleep(5)
 
@@ -650,9 +656,9 @@ class Bot:
             ("priority", f"{PRIO_LOW:.0f}/{PRIO_GWEI:.0f}/{PRIO_MAX:.0f} G"),
         ], "perintah: /total  /status  /help"))
         self.verify_structure(); log("struktur LP terverifikasi")
-        if TG_TOKEN:
-            threading.Thread(target=self.jalan_telegram, daemon=True).start()
-            log("thread Telegram jalan (terpisah dari loop perdagangan)")
+        self.harga_wajar(segarkan=True)          # isi cache sekali sebelum mulai
+        threading.Thread(target=self.jalan_latar, daemon=True).start()
+        log(f"thread latar jalan (harga wajar ${self.harga_wajar():.6f} + Telegram)")
         self.ensure_approval()
         backoff = 1; t0 = time.time()
         while RUN:
